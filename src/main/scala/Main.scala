@@ -27,8 +27,8 @@ object Main {
   private var personalisedPageRankID: Long = -1
   private var personalisedPageRank: Graph[Double, Double] = null
   private var pageRank: Graph[Double, Double] = null
-  private var canonicalGraph: Graph[String, Int] = null
-  private var connectedComponents: Graph[Int, Int] = null
+  private var stronglyConnectedComponents: Graph[VertexId, Int] = null
+  private var neighboursRDD: RDD[(VertexId, Array[(VertexId, String)])] = null
 
   def prompt(msg: String): Unit = {
     System.out.print(Console.GREEN + msg + " > " + Console.RESET)
@@ -102,12 +102,14 @@ object Main {
     }
 
     if(nodeID.isDefined) {
+      System.out.println("Running personalised page rank")
       personalisedPageRankID = nodeID.get
+    } else {
+      System.out.println("Running general page rank")
     }
-    System.out.println("Running page rank")
 
     try {
-      val quickstart = getYN("Do you wish to customise algorithm (y/n)")
+      val quickstart = !getYN("Do you wish to customise algorithm ")
       if (quickstart) {
         System.out.println("Running page rank algorithm")
         if(nodeID.isDefined) {
@@ -118,14 +120,14 @@ object Main {
         System.out.println("Completed page rank algorithm")
         return true
       }
-      val static = getYN("Do you wish to run in static or dynamic")
+      val static = getYN("Do you wish to run fixed iteration page rank (default dynamic)?")
       if (static) {
         val iters = getLong("Enter the number of iterations to run")
         System.out.println("Running page rank algorithm")
         if(nodeID.isDefined) {
-          personalisedPageRank = graph.personalizedPageRank(nodeID.get, iters)
+          personalisedPageRank = graph.staticPersonalizedPageRank(nodeID.get, iters.asInstanceOf[Int])
         } else {
-          pageRank = graph.pageRank(iters)
+          pageRank = graph.staticPageRank(iters.asInstanceOf[Int])
         }
         System.out.println("Completed page rank algorithm")
       } else {
@@ -147,12 +149,6 @@ object Main {
     }
   }
 
-  def genConnectedComponents(): Unit = {
-    System.out.println("Generating connected components")
-    canonicalGraph = graph.convertToCanonicalEdges()
-    System.out.println("Finished generating connected components")
-  }
-
   def loadTitles(filePath: String): DataFrame = {
     val vertexDF = spark.read.format("csv")
       .option("header", "false")
@@ -166,92 +162,94 @@ object Main {
     vertexDF
   }
 
-  def loadNewGraph(): Unit = {
-    val inner=new Breaks
-    val outer=new Breaks
-    outer.breakable {
-      while (true) {
-        inner.breakable {
-          try {
-            prompt("Please enter titles file")
+  def getTitleFile: Boolean = {
+    try{
+      prompt("Please enter titles file")
 
-            titleFile = StdIn.readLine().trim
-            if (titleFile.equals("help") || titleFile.equals("h")) {
-              error("File must contain two tab separated fields.\n" +
-                "The first of which is an integer representing the page id and the second is the title\n" +
-                "The file should not include a header")
-              inner.break
-            }
+      titleFile = StdIn.readLine().trim
+      if (titleFile.equals("help") || titleFile.equals("h")) {
+        error("File must contain two tab separated fields.\n" +
+          "The first of which is an integer representing the page id and the second is the title\n" +
+          "The file should not include a header")
+        return false
+      }
 
-            System.out.println("Loading " + titleFile + "...\nThis may take a while")
-            vertexDF = loadTitles(titleFile)
-            vertexRDD = vertexDF.rdd.map(x => (x(0).asInstanceOf[VertexId], x(1).asInstanceOf[String]))
-            System.out.println("Titles loaded. Found " + vertexDF.count() + " different pages")
+      System.out.println("Loading " + titleFile + "...\nThis may take a while")
+      vertexDF = loadTitles(titleFile)
+      vertexRDD = vertexDF.rdd.map(x => (x(0).asInstanceOf[VertexId], x(1).asInstanceOf[String]))
+      System.out.println("Titles loaded. Found " + vertexDF.count() + " different pages")
 
-            // Why cant this just be easy
-            outer.break
-          } catch {
-            case e: Exception => {
-              error("Failed to load titles from file. Please make sure the file exists and is in the correct format\nType help for more information\n" + e.getMessage)
-              // Null graph so GC can clean it
-              graph = null
-            }
-          }
-        }
+      return true
+    } catch {
+      case e: Exception => {
+        error("Failed to load titles from file. Please make sure the file exists and is in the correct format\nType help for more information\n" + e.getMessage)
+        // Null graph so GC can clean it
+        graph = null
       }
     }
-
-    while (true) {
-      inner.breakable {
-        try {
-          prompt("Please enter page links file")
-          edgesFile = StdIn.readLine().trim
-          System.out.println("Loading " + edgesFile + "...\nThis may take a while")
-
-          if (edgesFile.equals("help") || edgesFile.equals("h")) {
-            error("File must contain two tab separated integers.\n" +
-              "The first is the source page id, the second is the destination page id\n" +
-              "The file may include lines commented with #")
-            inner.break
-          }
-
-          val partitions = 1
-          val edgeGraph = GraphLoader.edgeListFile(spark.sparkContext, edgesFile, false, partitions)
-          graph = Graph(vertexRDD, edgeGraph.edges)
-          canonicalGraph = null
-          pageRank = null
-          connectedComponents = null
-
-          System.out.println("Links loaded. Found " + graph.edges.count() + " links")
-
-          return
-        } catch {
-          case e: Exception => {
-            error("Failed to load links from file. Please make sure the file exists and is in the correct format\nType help for more information\n" + e.getMessage)
-            // Null graph so GC can clean it
-            graph = null
-          }
-        }
-      }
-    }
+    false
   }
 
-  def getMatchingNames(fname: String, lname: String): DataFrame = {
+  def getEdgesFile: Boolean = {
+    try {
+      prompt("Please enter page links file")
+      edgesFile = StdIn.readLine().trim
+      System.out.println("Loading " + edgesFile + "...\nThis may take a while")
+
+      if (edgesFile.equals("help") || edgesFile.equals("h")) {
+        error("File must contain two tab separated integers.\n" +
+          "The first is the source page id, the second is the destination page id\n" +
+          "The file may include lines commented with #")
+        return false
+      }
+
+      val partitions = 1
+      val edgeGraph = GraphLoader.edgeListFile(spark.sparkContext, edgesFile, canonicalOrientation = false, partitions)
+      graph = Graph(vertexRDD, edgeGraph.edges)
+      pageRank = null
+      stronglyConnectedComponents = null
+      personalisedPageRank = null
+      personalisedPageRankID = -1
+      neighboursRDD = null
+
+      System.out.println("Links loaded. Found " + graph.edges.count() + " links")
+
+      return true
+    } catch {
+      case e: Exception => {
+        error("Failed to load links from file. Please make sure the file exists and is in the correct format\nType help for more information\n" + e.getMessage)
+        // Null graph so GC can clean it
+        graph = null
+      }
+    }
+    false
+  }
+
+  def loadNewGraph(): Unit = {
+    while(!getTitleFile) {}
+    while (!getEdgesFile) {}
+  }
+
+  def getMatchingNames(fname: String, lname: String, threshold: Int = 3): DataFrame = {
     val partialMatches = vertexDF.filter(col("page_title").rlike("(^|_)" + fname + "($|_)") || col("page_title").rlike("(^|_)" + lname + "($|_)"))
     partialMatches.persist()
-    partialMatches.show(10)
     val imperfectFullMatches = partialMatches.filter(col("page_title").rlike("(^|_)" + fname + "(_.*)??_" + lname + "($|_)"))
     imperfectFullMatches.persist()
-    imperfectFullMatches.show()
     val perfectMatches = imperfectFullMatches.filter(col("page_title").rlike("(^|_)" + fname + "_" + lname + "($|_)"))
     perfectMatches.persist()
-    perfectMatches.show()
 
-    if(perfectMatches.count() > 3) {
+    // Always have at least three matches
+    if(perfectMatches.count() >= threshold) {
+      imperfectFullMatches.unpersist()
+      partialMatches.unpersist()
       perfectMatches
-    } else if(imperfectFullMatches.count() > 3) {
+    } else if(imperfectFullMatches.count() >= threshold) {
+      perfectMatches.unpersist()
+      partialMatches.unpersist()
       imperfectFullMatches
     } else if(partialMatches.count() != 0) {
+      perfectMatches.unpersist()
+      imperfectFullMatches.unpersist()
       partialMatches
     } else {
       System.out.println("No matches!?! Go out there and get a wikipedia page for yourself!!!")
@@ -260,14 +258,16 @@ object Main {
   }
 
   def rankMe(): Unit = {
-    val sparkSession: SparkSession = ???
+    // Import implicts
+    val sparkSession: SparkSession = SparkSession.builder().getOrCreate()
     import sparkSession.implicits._
 
     val break = new Breaks
-    prompt("Enter the name you would like to search")
     do {
       break.breakable {
-        val name = StdIn.readLine()
+        prompt("Enter the name you would like to search")
+
+        val name = StdIn.readLine().toLowerCase
         val names = name.split(" ")
         if (names.length == 2) {
           val matchingDF = getMatchingNames(names(0), names(1))
@@ -292,7 +292,7 @@ object Main {
 
           System.out.println("Found " + topThree.length + " candidates. Running personalised rank")
 
-          val candidateNames = matchingDF.filter(col("page_id").isin(topThree)).map(x => (x(0), x(1))).collect().toMap
+          val candidateNames = matchingDF.filter(col("page_id").isInCollection(topThree)).map(x => (x(0).asInstanceOf[Long], x(1).asInstanceOf[String])).collect().toMap
           var bestCandidate = 0L
           var bestCandidateScore = 0.0
           for( candidate <- topThree ) {
@@ -305,8 +305,12 @@ object Main {
             }
           }
 
-          System.out.println("The most famous person with a similar name to you is: " + candidateNames(bestCandidate))
+          System.out.println("The most famous person with a similar name to you is: " + candidateNames(bestCandidate) + " (id: " + bestCandidate.toString + ")")
 
+          val tryAgain = getYN("Run again with a different name?")
+          if(!tryAgain) {
+            return
+          }
         } else {
           error("Please enter a single first and last name separated by space")
         }
@@ -314,19 +318,177 @@ object Main {
     } while (true)
   }
 
+  def nearestNeighbourTopicSearch(matchingTopics: Map[VertexId, String]): Unit = {
+    // Import implicts
+    val sparkSession: SparkSession = SparkSession.builder().getOrCreate()
+    import sparkSession.implicits._
+
+    if (neighboursRDD == null) {
+      System.out.println("Getting neighbouring topics")
+      val outRDD = graph.collectNeighbors(EdgeDirection.Out)
+      val inRDD = graph.collectNeighbors(EdgeDirection.In)
+      // Get bidirectional links - more likely to indicate relation ship
+      neighboursRDD = inRDD.join(outRDD).map(x => (x._1, x._2._1.intersect(x._2._2)))
+      neighboursRDD.persist()
+    }
+
+    // Generate page rank to rank neighbouring topics
+    genPageRank(None)
+    val rankMap = pageRank.vertices.collect().toMap
+
+    System.out.println("Processing neighbouring topics")
+
+    val neighbouringTopics = neighboursRDD.filter(x => matchingTopics.contains(x._1))
+    neighbouringTopics.persist()
+    if (neighbouringTopics.count() == 0) {
+      System.out.println("Didn't find any neighbouring topics")
+    } else {
+      neighbouringTopics.foreach(neighbours => {
+        if (neighbours._2.isEmpty) {
+          System.out.println("No closely related topics to " + matchingTopics(neighbours._1))
+        } else {
+          System.out.println("Topics related to " + matchingTopics(neighbours._1))
+          neighbours._2.sortBy(x => rankMap.get(x._1))
+          for (topic <- neighbours._2) {
+            System.out.println(topic._2)
+          }
+        }
+      })
+    }
+    neighbouringTopics.unpersist()
+
+  }
+
+  def connectedTopicSearch(matchingTopics: Map[VertexId, String]): Unit = {
+    if(stronglyConnectedComponents == null) {
+      System.out.println("Generating strongly connected components.")
+      val iters = getLong("Number of iterations to run")
+      stronglyConnectedComponents = graph.stronglyConnectedComponents(iters.asInstanceOf[Int])
+    }
+
+    // Generate page rank to rank connected topics
+    genPageRank(None)
+    val rankMap = pageRank.vertices.collect().toMap
+
+    val connectedComponents = stronglyConnectedComponents.vertices.filter(x => matchingTopics.contains(x._1)).map(x => x._2).collect().toSet
+
+    val relatedTopics = stronglyConnectedComponents.vertices.filter(x => connectedComponents.contains(x._2)).sortBy(x => rankMap.get(x._1))
+    val numTopics = getLong("How many topics do you want?")
+
+    val selectedTopics = relatedTopics.takeOrdered(numTopics.asInstanceOf[Int]).map(x => x._1).toSet
+
+    // Print names
+    graph.vertices.filter(x => selectedTopics.contains(x._1)).map(x => x._2).foreach(System.out.println)
+  }
+
   def whereToNext(): Unit = {
-    var loop = false
+    // Import implicts
+    val sparkSession: SparkSession = SparkSession.builder().getOrCreate()
+    import sparkSession.implicits._
+
+    val deep = getYN("Would you like to run the deep topic search (default nearest neighbour)")
     do {
       prompt("Enter topic name")
-    }while(loop)
+      val topic = StdIn.readLine().trim.toLowerCase().replace(" ", "_")
+
+      val matchingTopics = vertexDF.filter(col("page_title").contains(topic)).select("page_id", "page_title").as[(VertexId, String)].collect().toMap
+
+      if(matchingTopics.nonEmpty) {
+        if(deep)
+        {
+          connectedTopicSearch(matchingTopics)
+        } else {
+          nearestNeighbourTopicSearch(matchingTopics)
+        }
+      } else {
+        System.out.println("Didn't find any topics matching " + topic)
+      }
+
+      val tryAgain = getYN("Run again for a different topic?")
+      if(!tryAgain) {
+        return
+      }
+    }while(true)
+  }
+
+  def matchMe(): Unit = {
+    // Import implicts
+    val sparkSession: SparkSession = SparkSession.builder().getOrCreate()
+    import sparkSession.implicits._
+
+    val break = new Breaks
+    do {
+      break.breakable {
+        prompt("Enter your name")
+
+
+        val yourName = StdIn.readLine().toLowerCase
+        val yourNames = yourName.split(" ")
+        if (yourNames.length != 2) {
+          error("Please enter a single first and last name separated by space")
+          break.break
+        }
+        val yourMatchingDF = getMatchingNames(yourNames(0), yourNames(1), 1)
+
+        if (yourMatchingDF == null || yourMatchingDF.count() == 0) {
+          val tryAgain = getYN("Didn't find a matching name. Try again with a different name?")
+          if (!tryAgain) {
+            return
+          }
+          break.break
+        }
+
+        var theirMatchingDF: DataFrame = null
+        var loop = false
+        do {
+          loop = false
+          prompt("Enter their name")
+
+          val theirName = StdIn.readLine().toLowerCase
+          val theirNames = theirName.split(" ")
+          if (theirNames.length != 2) {
+            loop = true
+            error("Please enter a single first and last name separated by space")
+          }
+          else {
+            theirMatchingDF = getMatchingNames(theirNames(0), theirNames(1), 1)
+
+            if (theirMatchingDF == null || theirMatchingDF.count() == 0) {
+              val tryAgain = getYN("Didn't find a matching name. Try again with a different name?")
+              if (!tryAgain) {
+                return
+              }
+              loop = true
+            }
+          }
+        }while(loop)
+
+        val shortestPaths = ShortestPaths.run(graph, yourMatchingDF.map(x => x(0).asInstanceOf[VertexId]).collect().toSeq)
+        val theirIDMap = theirMatchingDF.select($"page_id").as[VertexId].collect().toSet
+        val filteredVertexes = shortestPaths.vertices.filter(x => theirIDMap.contains(x._1) && x._2.nonEmpty)
+        filteredVertexes.persist()
+        if(filteredVertexes.count() == 0) {
+          System.out.println("Bad news, wikipedia doesn't think this will work out")
+        }
+        else {
+          val dist = filteredVertexes.map(x => x._2.minBy(x => x._2)._2).min()
+          System.out.println("You are " + dist + " steps apart")
+        }
+        filteredVertexes.unpersist()
+
+        val tryAgain = getYN("Run again with a different name?")
+        if (!tryAgain) {
+          return
+        }
+      }
+    } while (true)
   }
 
   def printHelp(): Unit = {
     System.out.println(Console.RED + "Wikipedia relationships explorer help")
     System.out.println("Wikipedia relationships explorer allows you to discover interesting relationships between topics or people")
     System.out.println("\nList of commands:\n\n")
-    System.out.println("\twaiff | w              What am I famous for? Searches for people matching your name and see what things they are involved in")
-    System.out.println("\trankme | rm            Rank me. How important are the people who share my name")
+    System.out.println("\trankme | rm            Rank me. How important are the people who share my name.")
     System.out.println("\tmatchme | mm           Match making! Enter you and another persons name and we'll see how compatible wikipedia thinks you are")
     System.out.println("\twhere2next | w2n       Where to next? This tool can help you find related topics to one you are interested in")
     System.out.println("\treload | r             Reload the graph from different files")
@@ -351,7 +513,7 @@ object Main {
       sparkSessionBuilder = sparkSessionBuilder.config("spark.local.dir", args(0))
     }
 
-    val spark = sparkSessionBuilder.getOrCreate()
+    spark = sparkSessionBuilder.getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     System.out.println(spark)
     System.out.println("Welcome to wikipedia relationships explorer")
@@ -364,16 +526,16 @@ object Main {
       if(command.equalsIgnoreCase("help") || command.equalsIgnoreCase("h")) {
         printHelp()
       }
-      else if (command.equalsIgnoreCase("waiff") || command.equalsIgnoreCase("w")) {
-
-      }
       else if (command.equalsIgnoreCase("rankme") || command.equalsIgnoreCase("rm"))
       {
         rankMe()
       }
-      else if (command.equalsIgnoreCase("matchme") || command.equalsIgnoreCase("mm")) {}
+      else if (command.equalsIgnoreCase("matchme") || command.equalsIgnoreCase("mm"))
+      {
+        matchMe()
+      }
       else if (command.equalsIgnoreCase("where2next") || command.equalsIgnoreCase("w2n")) {
-
+        whereToNext()
       }
       else if (command.equalsIgnoreCase("reload") || command.equalsIgnoreCase("r")) {
         loadNewGraph()
