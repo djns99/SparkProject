@@ -96,7 +96,7 @@ object Main {
       // No need to rerun already generated overall pageRank
       val confirm = getYN("Do you want to rerun general page rank")
       if(!confirm) {
-        System.out.println("Aborted page rank")
+        System.out.println("Skipped page rank")
         return false
       }
     }
@@ -231,11 +231,11 @@ object Main {
   }
 
   def getMatchingNames(fname: String, lname: String, threshold: Int = 3): DataFrame = {
-    val partialMatches = vertexDF.filter(col("page_title").rlike("(^|_)" + fname + "($|_)") || col("page_title").rlike("(^|_)" + lname + "($|_)"))
+    val partialMatches = vertexDF.filter(col("page_title").rlike("(^| )" + fname + "($| )") || col("page_title").rlike("(^| )" + lname + "($| )"))
     partialMatches.persist()
-    val imperfectFullMatches = partialMatches.filter(col("page_title").rlike("(^|_)" + fname + "(_.*)??_" + lname + "($|_)"))
+    val imperfectFullMatches = partialMatches.filter(col("page_title").rlike("(^| )" + fname + "( .* | )" + lname + "($| )"))
     imperfectFullMatches.persist()
-    val perfectMatches = imperfectFullMatches.filter(col("page_title").rlike("(^|_)" + fname + "_" + lname + "($|_)"))
+    val perfectMatches = imperfectFullMatches.filter(col("page_title").rlike("(^| )" + fname + " " + lname + "( |$)"))
     perfectMatches.persist()
 
     // Always have at least three matches
@@ -389,7 +389,7 @@ object Main {
     val deep = getYN("Would you like to run the deep topic search (default nearest neighbour)")
     do {
       prompt("Enter topic name")
-      val topic = StdIn.readLine().trim.toLowerCase().replace(" ", "_")
+      val topic = StdIn.readLine().trim.toLowerCase()
 
       val matchingTopics = vertexDF.filter(col("page_title").contains(topic)).select("page_id", "page_title").as[(VertexId, String)].collect().toMap
 
